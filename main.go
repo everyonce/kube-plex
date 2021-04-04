@@ -1,8 +1,8 @@
 package main
 
 import (
+	"context"
 	"fmt"
-	"log"
 	"os"
 	"strings"
 	"time"
@@ -12,57 +12,58 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
+	klog "k8s.io/klog/v2"
 )
 
-// data pvc name
-var dataPVC = os.Getenv("DATA_PVC")
-
-// config pvc name
-var configPVC = os.Getenv("CONFIG_PVC")
-
-// transcode pvc name
-var transcodePVC = os.Getenv("TRANSCODE_PVC")
-
-// pms namespace
-var namespace = os.Getenv("KUBE_NAMESPACE")
-
-// image for the plexmediaserver container containing the transcoder. This
-// should be set to the same as the 'master' pms server
-var pmsImage = os.Getenv("PMS_IMAGE")
-var pmsInternalAddress = os.Getenv("PMS_INTERNAL_ADDRESS")
+var (
+	dataPVC            = os.Getenv("DATA_PVC")
+	configPVC          = os.Getenv("CONFIG_PVC")
+	transcodePVC       = os.Getenv("TRANSCODE_PVC")
+	namespace          = os.Getenv("KUBE_NAMESPACE")
+	pmsImage           = os.Getenv("PMS_IMAGE")
+	pmsInternalAddress = os.Getenv("PMS_INTERNAL_ADDRESS")
+)
 
 func main() {
+
+	isOK := checkEnv()
+	if isOK != true {
+		os.Exit(1)
+	}
+
 	env := os.Environ()
 	args := os.Args
 
 	rewriteEnv(env)
 	rewriteArgs(args)
 	cwd, err := os.Getwd()
+
 	if err != nil {
-		log.Fatalf("Error getting working directory: %s", err)
+		klog.Fatalf("Error getting working directory: %s", err)
 	}
+
 	pod := generatePod(cwd, env, args)
 
 	cfg, err := clientcmd.BuildConfigFromFlags("", "")
 	if err != nil {
-		log.Fatalf("Error building kubeconfig: %s", err)
+		klog.Fatalf("Error building kubeconfig: %s", err)
 	}
 
 	kubeClient, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
-		log.Fatalf("Error building kubernetes clientset: %s", err)
+		klog.Fatalf("Error building kubernetes clientset: %s", err)
 	}
 
-	pod, err = kubeClient.CoreV1().Pods(namespace).Create(pod)
+	pod, err = kubeClient.CoreV1().Pods(namespace).Create(context.TODO(), pod, metav1.CreateOptions{})
 	if err != nil {
-		log.Fatalf("Error creating pod: %s", err)
+		klog.Fatalf("Error creating pod: %s", err)
 	}
 
 	stopCh := signals.SetupSignalHandler()
 	waitFn := func() <-chan error {
 		stopCh := make(chan error)
 		go func() {
-			stopCh <- waitForPodCompletion(kubeClient, pod)
+			stopCh <- waitForPodCompletion(context.TODO(), kubeClient, pod)
 		}()
 		return stopCh
 	}
@@ -70,17 +71,26 @@ func main() {
 	select {
 	case err := <-waitFn():
 		if err != nil {
-			log.Printf("Error waiting for pod to complete: %s", err)
+			klog.Errorf("Error waiting for pod to complete: %s", err)
 		}
 	case <-stopCh:
-		log.Printf("Exit requested.")
+		klog.Info("Exit requested.")
 	}
 
-	log.Printf("Cleaning up pod...")
-	err = kubeClient.CoreV1().Pods(namespace).Delete(pod.Name, nil)
+	klog.Info("Cleaning up pod...")
+	err = kubeClient.CoreV1().Pods(namespace).Delete(context.TODO(), pod.Name, metav1.DeleteOptions{})
 	if err != nil {
-		log.Fatalf("Error cleaning up pod: %s", err)
+		klog.Fatalf("Error cleaning up pod: %s", err)
 	}
+}
+
+func checkEnv() bool {
+	if namespace == "" {
+		klog.Fatal("No namespace is set, please configure KUBE_NAMESPACE environment variable")
+		return false
+	}
+
+	return true
 }
 
 // rewriteEnv rewrites environment variables to be passed to the transcoder
@@ -88,6 +98,7 @@ func rewriteEnv(in []string) {
 	// no changes needed
 }
 
+// rewriteArgs
 func rewriteArgs(in []string) {
 	for i, v := range in {
 		switch v {
@@ -99,6 +110,7 @@ func rewriteArgs(in []string) {
 	}
 }
 
+// generatePod
 func generatePod(cwd string, env []string, args []string) *corev1.Pod {
 	envVars := toCoreV1EnvVar(env)
 	return &corev1.Pod{
@@ -165,6 +177,7 @@ func generatePod(cwd string, env []string, args []string) *corev1.Pod {
 	}
 }
 
+// toCoreV1EnvVar
 func toCoreV1EnvVar(in []string) []corev1.EnvVar {
 	out := make([]corev1.EnvVar, len(in))
 	for i, v := range in {
@@ -177,9 +190,10 @@ func toCoreV1EnvVar(in []string) []corev1.EnvVar {
 	return out
 }
 
-func waitForPodCompletion(cl kubernetes.Interface, pod *corev1.Pod) error {
+// waitForPodCompletion
+func waitForPodCompletion(ctx context.Context, cl kubernetes.Interface, pod *corev1.Pod) error {
 	for {
-		pod, err := cl.CoreV1().Pods(pod.Namespace).Get(pod.Name, metav1.GetOptions{})
+		pod, err := cl.CoreV1().Pods(pod.Namespace).Get(ctx, pod.Name, metav1.GetOptions{})
 		if err != nil {
 			return err
 		}
@@ -188,7 +202,7 @@ func waitForPodCompletion(cl kubernetes.Interface, pod *corev1.Pod) error {
 		case corev1.PodPending:
 		case corev1.PodRunning:
 		case corev1.PodUnknown:
-			log.Printf("Warning: pod %q is in an unknown state", pod.Name)
+			klog.Warningf("Warning: pod %q is in an unknown state", pod.Name)
 		case corev1.PodFailed:
 			return fmt.Errorf("pod %q failed", pod.Name)
 		case corev1.PodSucceeded:
