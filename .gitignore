@@ -1,0 +1,5 @@
+vendor
+debug
+kube_plex
+.git/
+.env
